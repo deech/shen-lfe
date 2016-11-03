@@ -1,0 +1,10 @@
+/Makefile
+_build/
+/lfe.config
+/rebar.config
+/rebar.lock
+/rebar3.crashdump
+/shen.beam
+/shen_macros.beam
+/priv
+/src

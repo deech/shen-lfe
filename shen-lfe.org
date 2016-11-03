@@ -1,0 +1,316 @@
+#+TITLE: Shen LFE
+#+AUTHOR: Aditya Siram
+#+PROPERTY: comments noweb
+#+OPTIONS: ^:nil ;; let an underscore be an underscore, disable sub-superscripting
+#+OPTIONS: timestamp:nil
+
+* Package Details
+** Lfe Config
+   #+BEGIN_SRC lisp :tangle lfe.config
+  #(project
+    (#(meta
+       (#(name shen_lfe)
+        #(description "A port of the Shen programming language to LFE")
+        #(version "0.0.1")
+        #(keywords ("LFE" "Lisp" "Language" "Shen"))
+        #(license
+          (#(name "MIT")
+           #(url "https://opensource.org/licenses/MIT")))
+        #(maintainers
+          ((#(name "Aditya Siram") #(email "aditya.siram@gmail.com"))))
+        #(repos
+          (#(github "deech/shen-lfe")))))
+     #(app
+       (#(mod #(shen_lfe ()))))))
+   #+END_SRC
+** Rebar
+   #+BEGIN_SRC erlang :tangle rebar.config
+{lfe_first_files, []}.
+{erl_opts, [debug_info]}.
+{eunit_opts, [verbose]}.
+{eunit_compile_opts, [
+                      {src_dirs, ["src"]}
+                     ]}.
+{deps, [
+        {lutil, {git, "https://github.com/lfex/lutil.git", {tag, "0.7.1"}}}
+       ]}.
+
+{plugins, [
+           {'lfe-compile',
+            {git, "git://github.com/lfe-rebar3/compile.git",
+             {tag, "0.7.0"}}},
+           {'lfe-repl',
+            {git, "https://github.com/lfe-rebar3/repl.git", {tag, "0.2.1"}}}
+          ]}.
+{provider_hooks, [
+                  {post, [{compile, {lfe, compile}}]}
+                 ]}.
+   #+END_SRC
+** Makefile
+   #+BEGIN_SRC elisp
+(setq org-src-preserve-indentation 't)
+   #+END_SRC
+
+   #+BEGIN_SRC makefile :tangle Makefile
+PROJECT = shen_lfe
+ROOT_DIR = $(shell pwd)
+REPO = $(shell git config --get remote.origin.url)
+LFE = _build/dev/lib/lfe/bin/lfe
+
+include priv/make/code.mk
+   #+END_SRC
+
+   #+BEGIN_SRC makefile :tangle priv/make/code.mk
+compile:
+	rebar3 compile
+
+check:
+	@rebar3 as test eunit
+
+repl:
+	@rebar3 as dev compile
+	@$(LFE) -pa `rebar3 as dev path -s " -pa "`
+
+shell:
+	@rebar3 shell
+
+clean:
+	@rebar3 clean
+	@rm -rf ebin/* _build/default/lib/$(PROJECT)
+
+clean-all: clean
+	@rebar3 as dev lfe clean
+   #+END_SRC
+** App Source
+   #+BEGIN_SRC erlang :tangle src/shen_lfe.app.src :comments nil
+{application, shen_lfe,
+ [
+  {description, "An implementation of the Shen programming language on top of LFE"},
+  {vsn, "0.0.1"},
+  {modules,
+   [
+    shen
+   ]},
+  {registered, []},
+  {applications,
+   [
+    kernel,
+    stdlib
+   ]},
+  {included_applications, []},
+  {env, []}
+ ]
+}.
+   #+END_SRC
+* Klambda Primitives
+** Modules
+   Shen functions primitives and all are sandboxed in the 'shen' module.
+
+   LFE is kind enough to provide us with a [[(Lisp compatibility layer)][Lisp compatibility layer]] so we use it to
+   make the port easier. It is mostly macros so there isn't any runtime cost.
+
+   Since Erlang does not have a global mutable variables all global state is stored
+   in Mnesia tables. The _lutil_ package provides a handy set of [[(mnesia)][macros]] for table
+   querying and updates.
+*** Shen
+    #+BEGIN_SRC lisp "(ref:%s)" :tangle src/shen.lfe
+     (defmodule shen
+       (export all))
+     (include-lib "lfe/include/cl.lfe") ;;; (ref:Lisp compatibility layer)
+     (include-lib "lutil/include/mnesia-macros.lfe") ;; (ref:mnesia)
+    #+END_SRC
+** Boolean Operations
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defmacro shen:if (pred a b) `(if pred a b))
+  (defmacro shen:and (a b) `(and a b))
+  (defmacro shen:or (a b) `(or a b))
+  (defmacro shen:cond (cases) `(cond ,cases))
+   #+END_SRC
+** Symbols
+   Symbols in KLambda and LFE are similar except for a couple of differences.
+   Firstly, in Klambda they are self-evaluating, meaning they don't need to be quoted:
+   #+BEGIN_EXAMPLE
+     > a
+     a
+   #+END_EXAMPLE
+   whereas in LFE (and most Lisps) they do:
+   #+BEGIN_EXAMPLE
+     > a
+     exception error: #(unbound_symb a)
+
+     > 'a
+     a
+   #+END_EXAMPLE
+
+   Secondly, when a function is passed in as an argument it can be directly applied to its
+   arguments:
+   #+BEGIN_EXAMPLE
+     (defun call-f (f a b c) (f a b c))
+   #+END_EXAMPLE
+   whereas in LFE (and, again, most Lisps), either ~funcall~ or ~apply~ is needed:
+   #+BEGIN_EXAMPLE
+     (defun call-f (f a b c) (funcall f a b c))
+   #+END_EXAMPLE
+
+   To deal with the differences between the Klambda and LFE we take a pass over the
+   Klambda AST below to quote symbols and fix function calls.
+*** Intern
+    Since strings in Erlang are just lists of characters, ~list_to_atom~ is the equivalent of ~intern~'ing.
+    #+BEGIN_SRC lisp :tangle src/shen.lfe
+      (defmacro shen:intern (s)
+        `(list_to_atom ,s))
+    #+END_SRC
+** String
+   In LFE, strings are just lists of characters so most of the primitives are
+   pretty simple, except for two:
+   - ~pos~ : Erlang has 1-based lists and Klambda is 0-based so the index must be [[(1-based indices][bumped]].
+   - ~string?~ : distinguising between a string and list is tricky. The [[(clj)][workaround]] uses a trick found in the [[https://github.com/lfex/clj/blob/master/src/clj-p.lfe#L5][clj]] library.
+   #+BEGIN_SRC lisp "(ref:%s)" :tangle src/shen.lfe
+  (defmacro shen:pos (s i)
+    `(cl:nth (+ ,i 1) ,s))  ;;; (ref:1-based indices)
+  (defmacro shen:tlstr (s)
+    `(cl:cdr ,s))
+  (defmacro shen:cn (s1 s2)
+    `(++ ,s1 ,s2))
+  (defmacro shen:str (a)
+    `(atom_to_list ,a))
+  (defmacro shen:string? (s)
+    `(io_lib:printable_list ,s)) ;;; (ref:clj)
+  (defmacro shen:n->string (c)
+    `(quote (,c)))
+  (defmacro shen:string->n (s)
+    `(cl:car ,s))
+   #+END_SRC
+** Assignments
+   Erlang (with good reason) makes it hard to define global mutable variables. But
+   unfortunately they are required by the Klambda standard so we use Mnesia to
+   store them as key-value pairs.
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defrecord assignment key value)
+
+  (defun start-database ()
+    (mnesia:start)
+    (mnesia:create_table 'assignment `(#(attributes ,(fields-assignment)))))
+
+  (defun set (s v)
+    (let ((assignment (make-assignment key s value v)))
+      (mnesia:transaction (lambda () (mnesia:write assignment)))))
+
+  (defun value (k)
+    (let* ((f (lambda () (: mnesia select 'assignment
+                           (match-spec ([(match-assignment key _k value v)]
+                                         (when (=:= _k k))
+                                         v)))))
+          ((tuple 'atomic results) (: mnesia transaction f)))
+      (if (== '() results)
+          (tuple 'error (++ "The variable '" (++ (atom_to_list k) "' is unbound.")))
+        (lists:nth 1 results))))
+   #+END_SRC
+** Error Handling
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defmacro shen:simple-error (e) `(tuple error ,e))
+   #+END_SRC
+
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defun trap-error
+      (((tuple error e) handler) (funcall handler e))
+      ((a _) a))
+  (defun error-to-string
+    (((tuple error e)) (++ "Error:" e)))
+   #+END_SRC
+** Generic Functions
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defmacro shen:lambda (arg body)
+    `(lambda (,arg) ,body))
+  (defmacro shen:let (n v body)
+    `(let ((,n ,v)) ,body))
+  (defmacro shen:= (x y)
+    `(== x y))
+  (defmacro shen:eval-kl (kl) 'TODO)
+  (defmacro shen:freeze (x)
+    `(function (lambda () ,x)))
+  (defmacro shen:defun (n args body)
+    `(defun ,n ,args, ,body))
+   #+END_SRC
+** Vectors
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defmacro shen:absvector () `(array:new))
+  (defmacro shen:address-> (v i value) `(array:set ,i ,value ,v))
+  (defmacro shen:<-address (v i) `(array:get ,i ,v))
+  (defmacro shen:absvector? (v) `(array:is_array ,v))
+   #+END_SRC
+** Streams
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defmacro shen:write-byte (n s)
+    `(file:write(,s (quote (,n)))))
+  (defmacro shen:read-byte (s)
+    `(case (: file read ,s 1)
+       ((tuple ok byte) byte)
+       (e e)))
+  (defmacro shen:open
+      ((f 'in) `(: file open ,f '(read)))
+    ((f 'out) `(: file open ,f '(write))))
+  (defmacro shen:close (s)
+    `(file:close s))
+   #+END_SRC
+** Time
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defun get-time
+    (('unix) (erlang:system_time))
+    ((x) (when (or (== x 'run) (== x 'real)))
+     (let (((list _ _ _ _ _ (tuple 'time t))
+            (erlang:system_info 'os_monotonic_time_source)))
+       t)))
+   #+END_SRC
+** Arithmetic
+   #+BEGIN_SRC lisp :tangle src/shen.lfe
+  (defmacro shen:+ (n1 n2) `(+ ,n1 ,n2))
+  (defmacro shen:- (n1 n2) `(- ,n1 ,n2))
+  (defmacro shen:* (n1 n2) `(* ,n1 ,n2))
+  (defmacro shen:/ (n1 n2) `(/ ,n1 ,n2))
+  (defmacro shen:> (n1 n2) `(> ,n1 ,n2))
+  (defmacro shen:< (n1 n2) `(< ,n1 ,n2))
+  (defmacro shen:> (n1 n2) `(> ,n1 ,n2))
+  (defmacro shen:<= (n1 n2) `(<= ,n1 ,n2))
+  (defmacro shen:>= (n1 n2) `(>= ,n1 ,n2))
+  (defmacro shen:number? (n) `(is_number ,n))
+   #+END_SRC
+* Rewrite The AST
+  #+BEGIN_SRC lisp :tangle src/shen.lfe
+    (eval '(defun test () ()))
+
+    (defun append-prefix (s)
+      (list_to_atom (++ "shen:" (atom_to_list s))))
+
+    (defun prefix-and-quote-symbols
+      (((list 'defun n args body) locally-scoped)
+       (list 'defun (shen:append-prefix n) args
+             (shen:prefix-and-quote-symbols body (++ args locally-scoped))))
+      (((list 'let n value body) locally-scoped)
+       (list (shen:append-prefix 'let) n (shen:prefix-and-quote-symbols (tuple value locally-scoped))
+             (shen:prefix-and-quote-symbols body (cons n locally-scoped))))
+      (((list 'cond pairs) locally-scoped)
+       (cons 'cond (lists:map
+                    (match-lambda
+                     ((pred action)
+                      (list (shen:prefix-and-quote-symbols pred locally-scoped)
+                            (shen:prefix-and-quote-symbols action locally-scoped))))
+                    pairs)))
+      (((cons a as) locally-scoped)
+       (cons (if (lists:member a locally-scoped)
+                 a
+               (shen:append-prefix a))
+             (lists:map (lambda (l) (shen:prefix-and-quote-symbols l locally-scoped)) as)))
+      ((x locally-scoped)
+       (if (lists:member x locally-scoped)
+           x
+         `(quote ,x))))
+
+    (defun get-arity (f locally-scoped)
+      (case (erlang:func_info
+             (if (lists:member f locally-scoped)
+                 f
+               (quote f))
+             'arity)
+        ((tuple 'arity arity) arity)))
+  #+END_SRC
